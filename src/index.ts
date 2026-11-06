@@ -59,15 +59,22 @@ async function createPublishedApplication(subdomain: string): Promise<{ status: 
       const config = tunnel?.config ?? {};
       const ingress: IngressRule[] = Array.isArray(config.ingress) ? config.ingress : [];
       const records = await cloudflare(`${zonePath}?${new URLSearchParams({ name: hostname })}`);
-      if (ingress.some((rule) => rule.hostname === hostname) || (Array.isArray(records) && records.length > 0)) {
-        return { status: 409, body: { status: "error", message: "This Hostname already exists." } };
+      const hasIngressRule = ingress.some((rule) => rule.hostname === hostname);
+      const hasDnsRecord = Array.isArray(records) && records.length > 0;
+      if (hasIngressRule && hasDnsRecord) {
+        return { status: 409, body: { status: "error", message: "This Hostname is already a Published Application." } };
       }
-      const newRule: IngressRule = { hostname, service: Bun.env.SERVICE_URL! };
-      const catchAllIndex = ingress.findIndex((rule) => !rule.hostname);
-      const updatedIngress = [...ingress];
-      if (catchAllIndex >= 0) updatedIngress.splice(catchAllIndex, 0, newRule);
-      else updatedIngress.push(newRule, { service: "http_status:404" });
-      await cloudflare(tunnelPath, { method: "PUT", body: JSON.stringify({ config: { ...config, ingress: updatedIngress } }) });
+      if (hasDnsRecord) {
+        return { status: 409, body: { status: "error", message: "A DNS Record already exists for this Hostname and is not managed by Hostlet." } };
+      }
+      if (!hasIngressRule) {
+        const newRule: IngressRule = { hostname, service: Bun.env.SERVICE_URL! };
+        const catchAllIndex = ingress.findIndex((rule) => !rule.hostname);
+        const updatedIngress = [...ingress];
+        if (catchAllIndex >= 0) updatedIngress.splice(catchAllIndex, 0, newRule);
+        else updatedIngress.push(newRule, { service: "http_status:404" });
+        await cloudflare(tunnelPath, { method: "PUT", body: JSON.stringify({ config: { ...config, ingress: updatedIngress } }) });
+      }
       await cloudflare(zonePath, { method: "POST", body: JSON.stringify({ type: "CNAME", name: hostname, content: `${Bun.env.CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com`, proxied: true, ttl: 1 }) });
       return { status: 201, body: { status: "created", hostname, url: `https://${hostname}` } };
     });

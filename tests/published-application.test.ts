@@ -36,6 +36,59 @@ async function startApp(extra: Record<string, string> = {}) {
 }
 
 describe("published applications", () => {
+  test("refuses a complete duplicate without writing either Cloudflare resource", async () => {
+    const calls: string[] = [];
+    const fake = Bun.serve({ port: freePort(), fetch(req) {
+      const path = new URL(req.url).pathname;
+      calls.push(`${req.method} ${path}`);
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress: [{ hostname: "app.example.test", service: config.SERVICE_URL }] } } });
+      if (req.method === "GET") return Response.json({ success: true, result: [{ name: "app.example.test" }] });
+      return Response.json({ success: true, result: {} });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "error", message: "This Hostname is already a Published Application." });
+    expect(calls).toHaveLength(2);
+  });
+
+  test("resumes a Hostname with an Ingress Rule by creating only the missing DNS Record", async () => {
+    const calls: string[] = [];
+    const fake = Bun.serve({ port: freePort(), fetch(req) {
+      const path = new URL(req.url).pathname;
+      calls.push(`${req.method} ${path}`);
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress: [{ hostname: "app.example.test", service: config.SERVICE_URL }] } } });
+      if (req.method === "GET") return Response.json({ success: true, result: [] });
+      if (req.method === "POST") return Response.json({ success: true, result: {} });
+      return Response.json({ success: false, errors: [{ message: "unexpected write" }] });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ status: "created", hostname: "app.example.test", url: "https://app.example.test" });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).toContain("POST /client/v4/zones/zone-id/dns_records");
+  });
+
+  test("refuses a foreign DNS Record without modifying it or adding an Ingress Rule", async () => {
+    const calls: string[] = [];
+    const fake = Bun.serve({ port: freePort(), fetch(req) {
+      const path = new URL(req.url).pathname;
+      calls.push(`${req.method} ${path}`);
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress: [] } } });
+      if (req.method === "GET") return Response.json({ success: true, result: [{ name: "app.example.test", type: "A", content: "192.0.2.1" }] });
+      return Response.json({ success: true, result: {} });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    expect(response.status).toBe(409);
+    expect(await response.json()).toEqual({ status: "error", message: "A DNS Record already exists for this Hostname and is not managed by Hostlet." });
+    expect(calls).toHaveLength(2);
+  });
+
   test("validates and lowercases one subdomain label before calling Cloudflare", async () => {
     const calls: string[] = [];
     const fake = Bun.serve({ port: freePort(), fetch(req) { calls.push(`${req.method} ${new URL(req.url).pathname}`); return Response.json({ success: true, result: {} }); } });
