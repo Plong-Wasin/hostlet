@@ -3,17 +3,57 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Hostlet Login</title>
+    <title>Hostlet</title>
   </head>
   <body>
     <main>
       <h1>Hostlet</h1>
       <p>Sign in to manage published hostnames.</p>
-      <form>
+      <p id="message" role="status" aria-live="polite"></p>
+      <form id="login-form">
         <label>Username <input name="username" autocomplete="username" required></label>
         <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
         <button type="submit">Log in</button>
       </form>
+      <section id="dashboard" hidden>
+        <h2>Dashboard</h2>
+        <p>You are signed in.</p>
+        <button id="logout" type="button">Log out</button>
+      </section>
     </main>
+    <script>
+      const form = document.querySelector("#login-form");
+      const dashboard = document.querySelector("#dashboard");
+      const message = document.querySelector("#message");
+      async function refreshSession() {
+        const response = await fetch("/api/session");
+        const session = await response.json();
+        form.hidden = session.authenticated;
+        dashboard.hidden = !session.authenticated;
+      }
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        message.textContent = "";
+        const fields = new FormData(form);
+        const response = await fetch("/api/login", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ username: fields.get("username"), password: fields.get("password") }),
+        });
+        if (!response.ok) {
+          message.textContent = response.status === 429 ? "Too many attempts. Try again later." : "Unable to sign in.";
+          return;
+        }
+        form.reset();
+        await refreshSession();
+      });
+      document.querySelector("#logout").addEventListener("click", async () => {
+        const response = await fetch("/api/logout", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        if (response.ok) await refreshSession();
+      });
+      refreshSession();
+    </script>
   </body>
 </html>

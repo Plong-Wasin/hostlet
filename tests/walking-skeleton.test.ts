@@ -107,9 +107,95 @@ describe("walking skeleton HTTP boundary", () => {
       const login = await fetch(`http://127.0.0.1:${appPort}/`);
       expect(login.status).toBe(200);
       expect(login.headers.get("content-type")).toContain("text/html");
-      expect(await login.text()).toContain("Hostlet");
+      const page = await login.text();
+      expect(page).toContain("Hostlet");
+      expect(page).toContain('fetch("/api/login"');
+      expect(page).toContain('id="dashboard"');
     } finally {
       fakeCloudflare.stop(true);
     }
+  });
+
+  test("login creates a signed strict HttpOnly 24-hour session; session and logout reflect it", async () => {
+    const appPort = freePort();
+    const child = await startServer({ ...requiredEnvironment, PORT: String(appPort) });
+    await listenForServer(child, appPort);
+    const origin = `http://127.0.0.1:${appPort}`;
+    const login = await fetch(`${origin}/api/login`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: requiredEnvironment.ADMIN_PASSWORD }),
+    });
+    expect(login.status).toBe(200);
+    const cookie = login.headers.get("set-cookie")!;
+    expect(cookie).toContain("HttpOnly");
+    expect(cookie).toContain("SameSite=Strict");
+    expect(cookie).toContain("Max-Age=86400");
+    const token = cookie.split(";")[0];
+    expect((await fetch(`${origin}/api/session`)).status).toBe(200);
+    expect(await (await fetch(`${origin}/api/session`, { headers: { Cookie: token } })).json()).toEqual({ authenticated: true });
+    const logout = await fetch(`${origin}/api/logout`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json", Cookie: token }, body: "{}",
+    });
+    expect(logout.status).toBe(200);
+    expect(logout.headers.get("set-cookie")).toContain("Max-Age=0");
+    expect(await (await fetch(`${origin}/api/session`, { headers: { Cookie: token } })).json()).toEqual({ authenticated: true });
+  });
+
+  test("wrong credentials, cross-origin mutations, non-JSON mutations and protected endpoints are refused", async () => {
+    const appPort = freePort();
+    const child = await startServer({ ...requiredEnvironment, PORT: String(appPort) });
+    await listenForServer(child, appPort);
+    const origin = `http://127.0.0.1:${appPort}`;
+    const wrong = await fetch(`${origin}/api/login`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "admin", password: "wrong" }),
+    });
+    expect(wrong.status).toBe(401);
+    expect((await fetch(`${origin}/api/login`, {
+      method: "POST", headers: { Origin: "https://attacker.test", "Content-Type": "application/json" }, body: "{}",
+    })).status).toBe(403);
+    expect((await fetch(`${origin}/api/login`, {
+      method: "POST", headers: { Origin: origin, "Content-Type": "text/plain" }, body: "{}",
+    })).status).toBe(403);
+    expect((await fetch(`${origin}/api/hostnames`, { method: "POST" })).status).toBe(401);
+    expect(await (await fetch(`${origin}/api/session`)).json()).toEqual({ authenticated: false });
+  });
+
+  test("login rate limit rejects the sixth failed attempt from one client IP", async () => {
+    const appPort = freePort();
+    const child = await startServer({ ...requiredEnvironment, PORT: String(appPort) });
+    await listenForServer(child, appPort);
+    const origin = `http://127.0.0.1:${appPort}`;
+    let last: Response | undefined;
+    for (let i = 0; i < 6; i += 1) {
+      last = await fetch(`${origin}/api/login`, {
+        method: "POST", headers: { Origin: origin, "Content-Type": "application/json", "CF-Connecting-IP": "192.0.2.1" },
+        body: JSON.stringify({ username: "admin", password: "wrong" }),
+      });
+    }
+    expect(last?.status).toBe(429);
+  });
+
+  test("login throttling is isolated by Cloudflare client IP", async () => {
+    const appPort = freePort();
+    const child = await startServer({ ...requiredEnvironment, PORT: String(appPort) });
+    await listenForServer(child, appPort);
+    const origin = `http://127.0.0.1:${appPort}`;
+
+    async function login(ip: string, password: string): Promise<Response> {
+      return fetch(`${origin}/api/login`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json", "CF-Connecting-IP": ip },
+        body: JSON.stringify({ username: "admin", password }),
+      });
+    }
+
+    for (let i = 0; i < 5; i += 1) expect((await login("192.0.2.10", "wrong")).status).toBe(401);
+    expect((await login("192.0.2.10", "wrong")).status).toBe(429);
+
+    const otherIpSuccess = await login("192.0.2.11", requiredEnvironment.ADMIN_PASSWORD);
+    expect(otherIpSuccess.status).toBe(200);
+    expect(otherIpSuccess.headers.get("set-cookie")).toContain("hostlet_session=");
+    expect((await login("192.0.2.10", requiredEnvironment.ADMIN_PASSWORD)).status).toBe(429);
   });
 });
