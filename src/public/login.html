@@ -57,6 +57,8 @@
           link.href = result.url;
           link.textContent = result.hostname;
           createMessage.append(link);
+        } else if (result.status === "partial") {
+          createMessage.textContent = `Partial: ${result.succeeded} succeeded; ${result.failed} failed. ${result.message || "Press Create again to finish."}`;
         } else createMessage.textContent = result.message || "Unable to create the Published Application.";
       });
       async function refreshSession() {

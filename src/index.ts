@@ -47,12 +47,18 @@ async function cloudflare(path: string, init: RequestInit = {}): Promise<any> {
 }
 function publicCloudflareError(error: unknown): string {
   const message = error instanceof Error ? error.message : "Cloudflare request failed";
-  return message.replace(/(?:Bearer\s+)?[A-Za-z0-9_-]{24,}/g, "[redacted]").replace(/\b(?:accounts|zones)\/[A-Za-z0-9_-]+/gi, "[redacted]").slice(0, 240);
+  const configuredSecrets = [Bun.env.CLOUDFLARE_API_TOKEN, Bun.env.CLOUDFLARE_ACCOUNT_ID, Bun.env.CLOUDFLARE_ZONE_ID, Bun.env.CLOUDFLARE_TUNNEL_ID]
+    .filter((value): value is string => Boolean(value))
+    .sort((left, right) => right.length - left.length);
+  let safeMessage = message;
+  for (const value of configuredSecrets) safeMessage = safeMessage.replaceAll(value, "[redacted]");
+  return safeMessage.replace(/(?:Bearer\s+)?[A-Za-z0-9_-]{24,}/g, "[redacted]").replace(/\b(?:accounts|zones)\/[A-Za-z0-9_-]+/gi, "[redacted]").slice(0, 240);
 }
 async function createPublishedApplication(subdomain: string): Promise<{ status: number; body: unknown }> {
   const hostname = `${subdomain}.${Bun.env.DOMAIN}`;
   const tunnelPath = `/accounts/${encodeURIComponent(Bun.env.CLOUDFLARE_ACCOUNT_ID!)}/cfd_tunnel/${encodeURIComponent(Bun.env.CLOUDFLARE_TUNNEL_ID!)}/configurations`;
   const zonePath = `/zones/${encodeURIComponent(Bun.env.CLOUDFLARE_ZONE_ID!)}/dns_records`;
+  let tunnelWriteSucceeded = false;
   try {
     return await serialCreate(async () => {
       const tunnel = await cloudflare(tunnelPath);
@@ -74,12 +80,17 @@ async function createPublishedApplication(subdomain: string): Promise<{ status: 
         if (catchAllIndex >= 0) updatedIngress.splice(catchAllIndex, 0, newRule);
         else updatedIngress.push(newRule, { service: "http_status:404" });
         await cloudflare(tunnelPath, { method: "PUT", body: JSON.stringify({ config: { ...config, ingress: updatedIngress } }) });
+        tunnelWriteSucceeded = true;
       }
       await cloudflare(zonePath, { method: "POST", body: JSON.stringify({ type: "CNAME", name: hostname, content: `${Bun.env.CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com`, proxied: true, ttl: 1 }) });
       return { status: 201, body: { status: "created", hostname, url: `https://${hostname}` } };
     });
   } catch (error) {
-    return { status: 502, body: { status: "error", message: publicCloudflareError(error) } };
+    const message = publicCloudflareError(error);
+    if (tunnelWriteSucceeded) {
+      return { status: 502, body: { status: "partial", succeeded: "Tunnel configuration", failed: "DNS Record", message } };
+    }
+    return { status: 502, body: { status: "error", message } };
   }
 }
 

@@ -36,6 +36,61 @@ async function startApp(extra: Record<string, string> = {}) {
 }
 
 describe("published applications", () => {
+  test("reports a Tunnel-only partial result and a retry finishes the DNS Record", async () => {
+    let tunnelConfig: any = { ingress: [] };
+    let dnsRecord = false;
+    let failDnsWrite = true;
+    const writes: string[] = [];
+    const fake = Bun.serve({ port: freePort(), async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: tunnelConfig } });
+      if (req.method === "GET") return Response.json({ success: true, result: dnsRecord ? [{ name: "app.example.test" }] : [] });
+      if (req.method === "PUT") { writes.push("tunnel"); tunnelConfig = (await req.json() as any).config; return Response.json({ success: true, result: {} }); }
+      if (req.method === "POST") {
+        writes.push("dns");
+        if (failDnsWrite) return Response.json({ success: false, errors: [{ message: `denied token ${config.CLOUDFLARE_API_TOKEN}, account ${config.CLOUDFLARE_ACCOUNT_ID}, zone ${config.CLOUDFLARE_ZONE_ID}, tunnel ${config.CLOUDFLARE_TUNNEL_ID}` }] }, { status: 403 });
+        dnsRecord = true;
+        return Response.json({ success: true, result: {} });
+      }
+      return Response.json({ success: false, errors: [] }, { status: 500 });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const create = () => fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    const partial = await create();
+    expect(partial.status).toBe(502);
+    const partialBody = await partial.json();
+    expect(partialBody.status).toBe("partial");
+    expect(partialBody.succeeded).toBe("Tunnel configuration");
+    expect(partialBody.failed).toBe("DNS Record");
+    for (const secret of [config.CLOUDFLARE_API_TOKEN, config.CLOUDFLARE_ACCOUNT_ID, config.CLOUDFLARE_ZONE_ID, config.CLOUDFLARE_TUNNEL_ID]) {
+      expect(partialBody.message).not.toContain(secret);
+    }
+    expect(writes).toEqual(["tunnel", "dns"]);
+
+    failDnsWrite = false;
+    const resumed = await create();
+    expect(resumed.status).toBe(201);
+    expect(await resumed.json()).toEqual({ status: "created", hostname: "app.example.test", url: "https://app.example.test" });
+    expect(writes).toEqual(["tunnel", "dns", "dns"]);
+    expect(dnsRecord).toBe(true);
+  });
+
+  test("reports an error with nothing changed when Cloudflare fails before a write", async () => {
+    let writes = 0;
+    const fake = Bun.serve({ port: freePort(), fetch(req) {
+      if (req.method === "GET" && new URL(req.url).pathname.endsWith("/configurations")) return Response.json({ success: false, errors: [{ message: "upstream unavailable" }] }, { status: 503 });
+      if (req.method !== "GET") writes += 1;
+      return Response.json({ success: true, result: [] });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    expect(response.status).toBe(502);
+    expect(await response.json()).toEqual({ status: "error", message: "upstream unavailable" });
+    expect(writes).toBe(0);
+  });
+
   test("refuses a complete duplicate without writing either Cloudflare resource", async () => {
     const calls: string[] = [];
     const fake = Bun.serve({ port: freePort(), fetch(req) {
@@ -149,5 +204,6 @@ describe("published applications", () => {
     expect(page).toContain('id="subdomain"');
     expect(page).toContain('const domain = "example.test"');
     expect(page).toContain('link.id = "success-link"');
+    expect(page).toContain('`Partial: ${result.succeeded} succeeded; ${result.failed} failed.');
   });
 });
