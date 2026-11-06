@@ -1,3 +1,4 @@
 .scratch/
 *.local.*
 .local/
+node_modules/
