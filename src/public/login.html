@@ -18,6 +18,12 @@
       <section id="dashboard" hidden>
         <h2>Dashboard</h2>
         <p>You are signed in.</p>
+        <form id="create-form">
+          <label>Subdomain <input id="subdomain" name="subdomain" autocomplete="off" minlength="1" maxlength="63" required></label>
+          <p>Hostname preview: <output id="hostname-preview">https://.__HOSTLET_DOMAIN__</output></p>
+          <button type="submit">Create</button>
+        </form>
+        <p id="create-message" role="status" aria-live="polite"></p>
         <button id="logout" type="button">Log out</button>
       </section>
     </main>
@@ -25,6 +31,34 @@
       const form = document.querySelector("#login-form");
       const dashboard = document.querySelector("#dashboard");
       const message = document.querySelector("#message");
+      const createForm = document.querySelector("#create-form");
+      const subdomainInput = document.querySelector("#subdomain");
+      const hostnamePreview = document.querySelector("#hostname-preview");
+      const createMessage = document.querySelector("#create-message");
+      const domain = "__HOSTLET_DOMAIN__";
+      function updatePreview() {
+        subdomainInput.value = subdomainInput.value.toLowerCase();
+        hostnamePreview.textContent = `https://${subdomainInput.value}.${domain}`;
+      }
+      subdomainInput.addEventListener("input", updatePreview);
+      createForm.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        updatePreview();
+        createMessage.textContent = "";
+        const response = await fetch("/api/hostnames", {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subdomain: subdomainInput.value }),
+        });
+        const result = await response.json();
+        if (response.ok && result.status === "created") {
+          createMessage.textContent = "Published Application created: ";
+          const link = document.createElement("a");
+          link.id = "success-link";
+          link.href = result.url;
+          link.textContent = result.hostname;
+          createMessage.append(link);
+        } else createMessage.textContent = result.message || "Unable to create the Published Application.";
+      });
       async function refreshSession() {
         const response = await fetch("/api/session");
         const session = await response.json();

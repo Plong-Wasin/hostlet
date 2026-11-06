@@ -1,0 +1,100 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { spawn, type Subprocess } from "bun";
+
+const config = {
+  ADMIN_USERNAME: "admin", ADMIN_PASSWORD: "correct horse battery staple",
+  SESSION_SECRET: "a-session-secret-that-is-at-least-32-chars", CLOUDFLARE_API_TOKEN: "fake-token",
+  CLOUDFLARE_ACCOUNT_ID: "account-id", CLOUDFLARE_ZONE_ID: "zone-id", CLOUDFLARE_TUNNEL_ID: "tunnel-id",
+  DOMAIN: "example.test", SERVICE_URL: "http://origin.internal:8080",
+};
+const children: Subprocess[] = [];
+const servers: ReturnType<typeof Bun.serve>[] = [];
+afterEach(() => {
+  for (const child of children.splice(0)) child.kill();
+  for (const server of servers.splice(0)) server.stop(true);
+});
+
+function freePort(): number {
+  const server = Bun.listen({ hostname: "127.0.0.1", port: 0, socket: { data() {} } });
+  const port = server.port;
+  server.stop();
+  return port;
+}
+
+async function startApp(extra: Record<string, string> = {}) {
+  const port = freePort();
+  const child = spawn({ cmd: ["bun", `${import.meta.dir}/../src/index.ts`], cwd: `${import.meta.dir}/..`, env: { ...process.env, ...config, PORT: String(port), ...extra }, stdout: "pipe", stderr: "pipe" });
+  children.push(child);
+  const base = `http://127.0.0.1:${port}`;
+  for (let i = 0; i < 200; i += 1) {
+    if (child.exitCode !== null) throw new Error(`app exited: ${await new Response(child.stderr!).text()}`);
+    try { await fetch(`${base}/healthz`); break; } catch { await Bun.sleep(25); }
+  }
+  const login = await fetch(`${base}/api/login`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json" }, body: JSON.stringify({ username: config.ADMIN_USERNAME, password: config.ADMIN_PASSWORD }) });
+  const cookie = login.headers.get("set-cookie")!.split(";")[0];
+  return { base, cookie };
+}
+
+describe("published applications", () => {
+  test("validates and lowercases one subdomain label before calling Cloudflare", async () => {
+    const calls: string[] = [];
+    const fake = Bun.serve({ port: freePort(), fetch(req) { calls.push(`${req.method} ${new URL(req.url).pathname}`); return Response.json({ success: true, result: {} }); } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    for (const subdomain of ["", "-bad", "bad-", "two.levels", "*", "a".repeat(64), "has space"]) {
+      const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain }) });
+      expect(response.status).toBe(400);
+    }
+    expect(calls).toEqual([]);
+  });
+
+  test("creates exact tunnel and DNS requests, preserving existing rules before catch-all", async () => {
+    const existing = [{ hostname: "old.example.test", service: "http://old.internal" }, { service: "http_status:404" }];
+    let written: unknown;
+    const received: Array<{ method: string; path: string; body?: unknown; authorization?: string }> = [];
+    const fake = Bun.serve({ port: freePort(), async fetch(req) {
+      const requestUrl = new URL(req.url);
+      const path = requestUrl.pathname + requestUrl.search;
+      const item: typeof received[number] = { method: req.method, path, authorization: req.headers.get("authorization") ?? undefined };
+      if (req.method === "PUT" || req.method === "POST") item.body = await req.json();
+      received.push(item);
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress: existing } } });
+      if (req.method === "GET" && path.includes("/dns_records")) return Response.json({ success: true, result: [] });
+      if (req.method === "PUT") { written = item.body; return Response.json({ success: true, result: {} }); }
+      if (req.method === "POST") return Response.json({ success: true, result: {} });
+      return Response.json({ success: false, errors: [{ message: "unexpected request" }] }, { status: 404 });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "MyApp" }) });
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ status: "created", hostname: "myapp.example.test", url: "https://myapp.example.test" });
+    expect(written).toEqual({ config: { ingress: [{ hostname: "old.example.test", service: "http://old.internal" }, { hostname: "myapp.example.test", service: "http://origin.internal:8080" }, { service: "http_status:404" }] } });
+    expect(received).toEqual([
+      { method: "GET", path: "/client/v4/accounts/account-id/cfd_tunnel/tunnel-id/configurations", authorization: "Bearer fake-token" },
+      { method: "GET", path: "/client/v4/zones/zone-id/dns_records?name=myapp.example.test", authorization: "Bearer fake-token" },
+      { method: "PUT", path: "/client/v4/accounts/account-id/cfd_tunnel/tunnel-id/configurations", authorization: "Bearer fake-token", body: written },
+      { method: "POST", path: "/client/v4/zones/zone-id/dns_records", authorization: "Bearer fake-token", body: { type: "CNAME", name: "myapp.example.test", content: "tunnel-id.cfargotunnel.com", proxied: true, ttl: 1 } },
+    ]);
+  });
+
+  test("adds a 404 catch-all when the tunnel has no ingress rules and shows a linked success message", async () => {
+    let configBody: any;
+    const fake = Bun.serve({ port: freePort(), async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress: [] } } });
+      if (req.method === "GET") return Response.json({ success: true, result: [] });
+      if (req.method === "PUT") { configBody = await req.json(); return Response.json({ success: true, result: {} }); }
+      return Response.json({ success: true, result: {} });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const response = await fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain: "app" }) });
+    expect(response.status).toBe(201);
+    expect(configBody).toEqual({ config: { ingress: [{ hostname: "app.example.test", service: "http://origin.internal:8080" }, { service: "http_status:404" }] } });
+    const page = await (await fetch(base)).text();
+    expect(page).toContain('id="subdomain"');
+    expect(page).toContain('const domain = "example.test"');
+    expect(page).toContain('link.id = "success-link"');
+  });
+});
