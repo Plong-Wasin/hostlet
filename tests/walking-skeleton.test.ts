@@ -175,4 +175,27 @@ describe("walking skeleton HTTP boundary", () => {
     }
     expect(last?.status).toBe(429);
   });
+
+  test("login throttling is isolated by Cloudflare client IP", async () => {
+    const appPort = freePort();
+    const child = await startServer({ ...requiredEnvironment, PORT: String(appPort) });
+    await listenForServer(child, appPort);
+    const origin = `http://127.0.0.1:${appPort}`;
+
+    async function login(ip: string, password: string): Promise<Response> {
+      return fetch(`${origin}/api/login`, {
+        method: "POST",
+        headers: { Origin: origin, "Content-Type": "application/json", "CF-Connecting-IP": ip },
+        body: JSON.stringify({ username: "admin", password }),
+      });
+    }
+
+    for (let i = 0; i < 5; i += 1) expect((await login("192.0.2.10", "wrong")).status).toBe(401);
+    expect((await login("192.0.2.10", "wrong")).status).toBe(429);
+
+    const otherIpSuccess = await login("192.0.2.11", requiredEnvironment.ADMIN_PASSWORD);
+    expect(otherIpSuccess.status).toBe(200);
+    expect(otherIpSuccess.headers.get("set-cookie")).toContain("hostlet_session=");
+    expect((await login("192.0.2.10", requiredEnvironment.ADMIN_PASSWORD)).status).toBe(429);
+  });
 });
