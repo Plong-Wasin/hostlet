@@ -97,4 +97,58 @@ describe("published applications", () => {
     expect(page).toContain('const domain = "example.test"');
     expect(page).toContain('link.id = "success-link"');
   });
+
+  test("preserves every ingress rule when different Creates arrive concurrently", async () => {
+    let ingress: Array<{ hostname?: string; service: string }> = [{ service: "http_status:404" }];
+    const fake = Bun.serve({ port: freePort(), async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method === "GET" && path.endsWith("/configurations")) {
+        await Bun.sleep(30);
+        return Response.json({ success: true, result: { config: { ingress } } });
+      }
+      if (req.method === "GET") return Response.json({ success: true, result: [] });
+      if (req.method === "PUT") {
+        const body = await req.json() as { config: { ingress: typeof ingress } };
+        ingress = body.config.ingress;
+        return Response.json({ success: true, result: {} });
+      }
+      if (req.method === "POST") return Response.json({ success: true, result: {} });
+      return Response.json({ success: false, errors: [{ message: "unexpected request" }] }, { status: 404 });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const create = (subdomain: string) => fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain }) });
+    const responses = await Promise.all([create("first"), create("second"), create("third")]);
+    expect(responses.map((response) => response.status)).toEqual([201, 201, 201]);
+    expect(ingress.filter((rule) => rule.hostname).map((rule) => rule.hostname).sort()).toEqual([
+      "first.example.test", "second.example.test", "third.example.test",
+    ]);
+  });
+
+  test("releases the Tunnel update lock after a failed Create", async () => {
+    let ingress: Array<{ hostname?: string; service: string }> = [{ service: "http_status:404" }];
+    let failFirstWrite = true;
+    const fake = Bun.serve({ port: freePort(), async fetch(req) {
+      const path = new URL(req.url).pathname;
+      if (req.method === "GET" && path.endsWith("/configurations")) return Response.json({ success: true, result: { config: { ingress } } });
+      if (req.method === "GET") return Response.json({ success: true, result: [] });
+      if (req.method === "PUT") {
+        if (failFirstWrite) {
+          failFirstWrite = false;
+          return Response.json({ success: false, errors: [{ message: "temporary failure" }] }, { status: 500 });
+        }
+        const body = await req.json() as { config: { ingress: typeof ingress } };
+        ingress = body.config.ingress;
+        return Response.json({ success: true, result: {} });
+      }
+      if (req.method === "POST") return Response.json({ success: true, result: {} });
+      return Response.json({ success: false, errors: [{ message: "unexpected request" }] }, { status: 404 });
+    } });
+    servers.push(fake);
+    const { base, cookie } = await startApp({ CLOUDFLARE_API_BASE: `http://127.0.0.1:${fake.port}/client/v4` });
+    const create = (subdomain: string) => fetch(`${base}/api/hostnames`, { method: "POST", headers: { Origin: base, "Content-Type": "application/json", Cookie: cookie }, body: JSON.stringify({ subdomain }) });
+    expect((await create("failed")).status).toBe(502);
+    expect((await create("after-failure")).status).toBe(201);
+    expect(ingress.map((rule) => rule.hostname)).toEqual(["after-failure.example.test", undefined]);
+  });
 });
