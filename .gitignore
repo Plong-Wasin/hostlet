@@ -2,3 +2,4 @@
 *.local.*
 .local/
 node_modules/
+.env

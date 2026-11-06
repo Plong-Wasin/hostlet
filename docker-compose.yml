@@ -1,0 +1,20 @@
+# Local run: `cp .env.example .env`, fill it in, then `docker compose up --build`.
+# Production on Dokploy uses docker-compose.dokploy.yml instead (no published ports).
+#
+# Single replica only: the Tunnel config GET->PUT mutex lives in-process
+# (see docs/adr/0001-no-database-single-replica.md).
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "3000:3000"
+    healthcheck:
+      test: ["CMD", "bun", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
